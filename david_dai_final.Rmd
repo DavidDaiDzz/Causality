@@ -1,0 +1,407 @@
+---
+title: "David Dai Causal Inference Full Code"
+output:
+  html_document:
+    df_print: paged
+date: "2024-08-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##1.A
+
+```{r}
+library(dplyr)
+library(estimatr)
+library(tidyr)
+library(rdd)
+patents <- read.csv("patents.csv")
+
+aggregated_data <- patents %>%
+  group_by(uspto_class) %>%
+  summarize(usa_pre_mean = mean(count_usa[grntyr < 1919]),usa_post_mean = mean(count_usa[grntyr >= 1919]),treatment = max(treat))
+
+aggregated_data <- aggregated_data %>%
+  mutate(diff = usa_post_mean - usa_pre_mean)
+
+model_1A <- lm_robust(diff ~ treatment, data = aggregated_data)
+summary(model_1A)
+```
+We see a positive treatment effect of 0.2553 of the treatment. The confidence interval is [0.1814, 0.3292], which does not include 0. Thus we fail to reject the null which states that there is no treatment effect.
+
+##1.B
+```{r}
+treated_subclass <- aggregated_data[aggregated_data$treatment==1,]
+untreated_subclass <- aggregated_data[aggregated_data$treatment==0,]
+print(c(mean(treated_subclass$usa_pre_mean),mean(untreated_subclass$usa_pre_mean)))
+```
+Ignorability likely not hold, since we can see that for treated group, the pre-mean is generally lower than untreated group. This suggest that the law tends to give subclasses which previously do not doing well (less count of patents) the access to enemy country patent access.
+
+##1.C
+```{r}
+
+treatment_table <- patents[patents$grntyr == 1919, c("uspto_class", "treat")]
+
+times <- list(
+  c(1918, 1917),
+  c(1918, 1916),
+  c(1918, 1915),
+  c(1918, 1914)
+)
+
+for (time in times) {
+  period <- patents %>% filter(grntyr %in% time)
+  period_df <- merge(period, treatment_table, by = "uspto_class", all.x = TRUE) %>% group_by(uspto_class) %>%
+    summarize(trend_diff = count_usa[grntyr == time[1]] - count_usa[grntyr == time[2]],
+              treatment = max(treat.y))
+  model_trend <- lm_robust(trend_diff ~ treatment, data = period_df)
+  print(summary(model_trend))
+}
+```
+My method is to get trend_diff and treatment variable and then do a regression, where trend_diff is the change of number of patent of one subclass during the period, and treatment is a binary variable indicating if the subclass is exposed to treatment.
+Result analysis:
+(1918, 1917): if the subclass is exposed to treatment, then we should expect 0.027 more patents for this subclass. But the confidence interval includes 0, meaning that this value is not statistically significant. We reject the null that these effect differ from 0 (means there is no effect). Thus parallel trend holds here.
+(1918, 1916): if the subclass is exposed to treatment, then we should expect 0.096 more patents for this subclass. The confidence interval does not include 0, meaning that this value is statistically significant. We failed to reject the null that these effect differ from 0 (means there is effect). Thus parallel trend does not hold here.
+(1918, 1915): if the subclass is exposed to treatment, then we should expect 0.063 more patents for this subclass. But the confidence interval include 0, meaning that this value is not statistically significant.We reject the null that these effect differ from 0 (means there is no effect). Thus parallel trend holds here.
+(1918, 1914): if the subclass is exposed to treatment, then we should expect 0.023 less patents for this subclass. But the confidence interval includes 0, meaning that this value is not statistically significant. We reject the null that these effect differ from 0 (means there is no effect). Thus parallel trend holds here.
+Overall, if parallel trend holds here, we would expect the estimate to be 0. Thus although (1918,1916) has non-zero effect, overall the trend is parallel(no effect on other period)
+
+##1.D
+```{r}
+patent_1D <- patents %>% group_by(uspto_class) %>%
+  summarize(
+    change_for_patents = sum(count_for[grntyr >= 1919]) - sum(count_for[grntyr < 1919]),
+    count_usa_post = sum(count_usa[grntyr >= 1919]),
+    count_usa_pre = sum(count_usa[grntyr < 1919]),
+    treatment = max(treat[grntyr == 1919])
+  )
+
+patent_1D <- patent_1D %>%
+  mutate(strata = ntile(change_for_patents, 6))
+
+results_1D <- data.frame()
+
+for (stratum in unique(patent_1D$strata)) {
+  
+  stratum_data <- patent_1D %>% filter(strata == stratum)
+  
+  mean_diff_usa_treated <- mean(stratum_data$count_usa_post[stratum_data$treatment == 1] - stratum_data$count_usa_pre[stratum_data$treatment == 1], na.rm = TRUE)
+  mean_diff_usa_untreated <- mean(stratum_data$count_usa_post[stratum_data$treatment == 0] - stratum_data$count_usa_pre[stratum_data$treatment == 0], na.rm = TRUE)
+  
+  treatment_effect <- mean_diff_usa_treated - mean_diff_usa_untreated
+  n_treated <- sum(stratum_data$treatment == 1)
+  n_untreated <- sum(stratum_data$treatment == 0)
+  
+  strata_variance_treated <- var(stratum_data$count_usa_post[stratum_data$treatment == 1] - stratum_data$count_usa_pre[stratum_data$treatment == 1], na.rm = TRUE) / n_treated
+  strata_variance_untreated <- var(stratum_data$count_usa_post[stratum_data$treatment == 0] - stratum_data$count_usa_pre[stratum_data$treatment == 0], na.rm = TRUE) / n_untreated
+  variance <- strata_variance_treated + strata_variance_untreated
+  count_strata <- sum(patent_1D$strata==stratum)
+  
+  results_1D <- rbind(results_1D, data.frame(strata = stratum, treatment_effect = treatment_effect, variance = variance,count_strata = count_strata))
+}
+
+results_1D <- results_1D %>%
+  mutate(weight = count_strata / sum(results_1D$count_strata))
+
+ate_block <- sum(results_1D$treatment_effect * results_1D$weight)
+
+variance_ate_block <- sum(results_1D$variance * (results_1D$weight^2))
+
+se_ate_block <- sqrt(variance_ate_block)
+
+ci_lower <- ate_block - 1.96 * se_ate_block
+ci_upper <- ate_block + 1.96 * se_ate_block
+
+c(ATE = ate_block, Variance = variance_ate_block, SE = se_ate_block, CI_Lower = ci_lower, CI_Upper = ci_upper)
+```
+```{r}
+patent_1D <- patents %>% 
+  group_by(uspto_class) %>%
+  summarize(
+    change_for_patents = sum(count_for[grntyr >= 1919]) - sum(count_for[grntyr < 1919]),
+    count_usa_post = sum(count_usa[grntyr >= 1919]),
+    count_usa_pre = sum(count_usa[grntyr < 1919]),
+    treatment = max(treat[grntyr == 1919])
+  )
+
+patent_1D <- patent_1D %>%
+  mutate(strata = ntile(change_for_patents, 6))
+
+results_1D_2 <- data.frame()
+for (stratum in unique(patent_1D$strata)) {
+
+  stratum_data <- patent_1D %>% filter(strata == stratum)
+
+  lm_model <- lm((count_usa_post - count_usa_pre) ~ treatment, data = stratum_data)
+  
+  treatment_effect <- coef(lm_model)["treatment"]
+  
+  variance <- summary(lm_model)$coefficients["treatment", "Std. Error"]^2
+
+  count_strata <- nrow(stratum_data)
+  
+  results_1D_2 <- rbind(results_1D_2, data.frame(strata = stratum, treatment_effect = treatment_effect, variance = variance, count_strata = count_strata))
+}
+
+results_1D_2 <- results_1D_2 %>%
+  mutate(weight = count_strata / sum(count_strata))
+
+ate_block <- sum(results_1D_2$treatment_effect * results_1D_2$weight)
+
+variance_ate_block <- sum(results_1D_2$variance * (results_1D_2$weight^2))
+
+se_ate_block <- sqrt(variance_ate_block)
+
+ci_lower <- ate_block - 1.96 * se_ate_block
+ci_upper <- ate_block + 1.96 * se_ate_block
+
+c(ATE = ate_block, Variance = variance_ate_block, SE = se_ate_block, CI_Lower = ci_lower, CI_Upper = ci_upper)
+
+```
+
+We can successfully reject the null of no treatment effect at the alpha=0.05 level since the CI in both methods (simple mean difference and linear regression) does not include 0. This means that the treatment has a positive effect on number of patents granted for usa. This result has the same direction as question A, but significant larger magnitude. This difference might due to the control on foreign pantents. This suggest that the overall amount of foreign patenting in the sub class and its change over time might be a confounder.
+
+Note that the variance is larger in linear regression method than simple mean difference method, this is because lm regression takes model uncertainty into account.
+
+##2.A
+```{r}
+ER <- read.csv("ER.csv")
+library(rdrobust)
+outcomes <- c("ER$all", "ER$injury", "ER$alcohol")
+bandwidths <- c(1, 0.5, 2)
+
+results <- list()
+
+for (outcome in outcomes) {
+  for (h in bandwidths) {
+    result_name <- paste("rdd", gsub("er\\$", "", outcome), h, sep = "_")
+  
+    results[[result_name]] <- rdrobust(y = eval(parse(text = outcome)), x = ER$age, c = 21, h = h)
+
+    print(paste("Summary for", result_name))
+    print(summary(results[[result_name]]))
+  }
+}
+
+```
+"all" outcome variable seems to have the largest effect. The change of bandwidth influence results by a non-negligible amounts.
+##2.B
+```{r}
+library(rdrobust)
+rdplot(y = ER$all, x = ER$age, c = 21)
+```
+```{r}
+rdplot(y = ER$injury, x = ER$age, c = 21)
+```
+```{r}
+rdplot(y = ER$alcohol, x = ER$age, c = 21)
+```
+##2.C
+```{r}
+rdd_2C_illness <- RDestimate(illness ~ age, data = ER, cutpoint = 21,bw=1)
+summary(rdd_2C_illness)
+rdplot(y = ER$illness, x = ER$age, c = 21,
+       title = "Placebo Test",
+       y.label = "Illness",
+       x.label = "Age")
+```
+The placebo test is not statistically significant with p-values significantly larger than 0.05 for all different bandwidth. This means that the RDD is plausible that the age does have effect on all, injury and alcohol.
+
+##3.A
+```{r}
+library(ggdag)
+dag <- dagify(
+  college ~ income + score + distance + fcollege + tuition,
+  score ~ income + fcollege,
+  tuition ~ wage,
+  urban ~ income,
+  distance ~ urban,
+  income ~ fcollege+wage,
+  exposure = "income",
+  outcome = "college"
+)
+
+plot(dag)
+```
+income->score: the richer the family, more recources a student has to improve score.
+score->college: higher score means that the student is more outstanding, thus more likely to be accepted to college.
+Income->urban:the houses in the urban area are typically more expensive. 
+Urban->distance to college
+distance->college. Since students might prefer colleges closer to their family.
+father's college->family income: because people who have higher degree tend to have higher salary. father's college->impact score: since if father has college degree, they can help their child to improve grades
+Father's college->college: if the father think the college education is useless, then they will not let their children to go to college, vice versa.
+tuition->college: if it is  way too expensive, then the student might not be able to afford it then failed to go to college
+Wage->tuition: wage can be treated as the benchmark of local consumption level or income level, which can influence tuition
+wage->income, since family income is based on the local income level.
+income->college: the treatment effect we want to figure out, intuitively, as income increase, students tend to have higher chance attending college.
+
+We only need to condition on fcollege and wage.By conditioning on these two variables, all back door paths are blocked
+
+3.B
+I want to use stratified ATE estimator, since we need to condition on fcollege and wage, which can be achieved in CATE.
+Besides conditional ignorability, we need conditional positivity, consistency and discreteness of covariates. These assumptions hold because there should be non-zero and less than 1 probability of going to college, meaning that a high school student has the chance of attending college (not 0) but not definitely (not 1).For discreteness of covariates, we can categorize wage by a range, which makes it discrete. For fcollege, it is obviously discrete. For variance calculation, we can use estimator for stratified ATE.
+
+3.C
+```{r}
+college <- read.csv("college.csv")
+
+college <- college %>%
+  mutate(wage_quartile = ntile(wage, 4))
+
+CATE_estimates <- college %>%
+  group_by(wage_quartile, fcollege) %>%
+  summarize(
+    CATE = mean(college[income == 1]) - mean(college[income == 0]),
+    variance = var(college[income == 1])/sum(income == 1) + var(college[income == 0])/sum(income == 0),
+    count_treated = sum(income == 1),
+    count_untreated = sum(income == 0),
+    .groups = 'drop')
+
+overall_ATE <- CATE_estimates %>%
+  mutate(weight = (count_treated + count_untreated) / sum(count_treated + count_untreated)) %>%
+  summarize(ATE = sum(CATE * weight),
+            variance_ATE = sum(variance * (weight^2)),
+            .groups = 'drop')
+
+se_ATE <- sqrt(overall_ATE$variance_ATE)
+ci_lower <- overall_ATE$ATE - 1.96 * se_ATE
+ci_upper <- overall_ATE$ATE + 1.96 * se_ATE
+
+c(ATE = overall_ATE$ATE,
+  SE = se_ATE,
+  CI_Lower = ci_lower,
+  CI_Upper = ci_upper)
+
+```
+We see that the treatment has a statistically significant positive treatment effect since the CI does not contain 0. This means that if the family income is higher than 25k per year, the childen are more likely to attend to college.
+
+4.A
+```{r}
+nazis <- read.csv("nazis.csv")
+
+nazis <- nazis %>%
+  mutate(vote_portion = nazivote / nvoter)
+
+model <- lm(vote_portion ~ shareblue, data = nazis)
+
+summary(model)
+
+confint(model, level =0.95)
+```
+
+The slope coefficient 0.06518 suggests a positive relationship between the proportion of blue-collar voters and the Nazi vote share, but this relationship is not statistically significant (p-value = 0.212), with a CI including 0. For shareblue, a standard error of 0.05220 indicates that the estimated slope of 0.06518 could flucutates by approximately ±0.05220 in repeated samples. CI means that with a 95% confidence, the true value of blue collar workers' impact on Nazi vote share lies in this range, where 0 is a plausible value.
+
+4.B
+```{r}
+library(ggplot2)
+X_seq <- seq(min(nazis$shareblue), max(nazis$shareblue), length.out = 100)
+predictions <- predict(model, newdata = data.frame(shareblue = X_seq), interval = "confidence")
+pred_df <- data.frame(
+  shareblue = X_seq,
+  fit = predictions[, "fit"],
+  lwr = predictions[, "lwr"],
+  upr = predictions[, "upr"]
+)
+
+ggplot(pred_df, aes(x = shareblue, y = fit)) +
+  geom_line(color = "blue") + 
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.2) + 
+  labs(title = "Predicted Vote Share vs. Proportion of Blue-Collar Voters",
+       x = "Proportion of Blue-Collar Voters",
+       y = "Predicted Vote Share") +
+  theme_minimal()
+```
+This plot shows a positive relationship between proportion of blue collar voters and Nazis vote share. This means that if a precinct has more blue collar workers, it tends to vote for Nazis.
+##4.C
+```{r}
+nazis <- nazis %>%
+  mutate(minused = (1-shareblue))
+model <- lm(vote_portion ~ 0 + shareblue + minused, data = nazis)
+summary(model)
+```
+alpha = beta^star;
+beta = alpha^star - beta^star
+alpha^star gives the vote share for Nazis where all voters are blue collar workers, which is 46%. beta^star gives the vote share for Nazis where all voters are non blue collar workers, which is 39%. Both of them are statistically significant with a small p-value. This suggests that blue collar workers are more likely to vote for Nazis.
+
+4.D
+```{r}
+model <- lm(vote_portion ~ 0 + shareself + shareblue + sharewhite + sharedomestic + shareunemployed, data = nazis)
+summary(model)
+```
+Self: if all people in a precinct are self employed, then the Nazis vote share would be 111%. This estimate is statistically significant due to a p-value less than 0.05.
+blue: if all people in a precinct are blue collar workers, then the Nazis vote share would be 54%. This estimate is statistically significant due to a p-value less than 0.05.
+white: if all people in a precinct are white collar workers, then the Nazis vote share would be 28.5%. This estimate is statistically significant due to a p-value less than 0.05.
+domestic: if all people in a precinct are domestically employed, then the Nazis vote share would be 5.2%. This estimate is not statistically significant due to a p-value larger than 0.05.
+unemployed: if all people in a precinct are unemployed, then the Nazis vote share would be -2.8%. This estimate is not statistically significant due to a p-value larger than 0.05.
+Assumptions: no correlation between each variable. Linear relationship between IVs and DV. 
+
+4.E
+```{r}
+nazis <- nazis %>% mutate(Y = shareself + sharewhite + sharedomestic + shareunemployed)
+nazis <- nazis %>%
+  mutate(
+    W_i1_min = pmax(0, (vote_portion - (1 - shareblue)) / shareblue),
+    W_i1_max = pmin(1, vote_portion / shareblue)
+  )
+
+nazis <- nazis %>%
+  mutate(blue_collar_voters = shareblue * nvoter)
+
+nation_min <- sum(nazis$W_i1_min * nazis$blue_collar_voters) / sum(nazis$blue_collar_voters)
+nation_max <- sum(nazis$W_i1_max * nazis$blue_collar_voters) / sum(nazis$blue_collar_voters)
+
+c(
+  Nation_min = nation_min,
+  Nation_max = nation_max
+)
+```
+The nationwide min is close to 0, suggesting that when all non blue collar workers vote for Nazis, only 0.03% of blue collar workers will vote for Nazis. The nationwide max is close to 1, suggesting that when all non blue collar workers do not vote for Nazis, 95% of blue collar workers will vote for Nazis. This wide range suggests that it is possible that non or all of blue collar workers will vote for Nazis under extreme cases, showing the complexity of ecological inference.
+
+5.A
+```{r}
+wage <- read.csv("wage2.csv")
+model_5A <- lm_robust(wage ~ educ, data = wage)
+summary(model_5A)
+```
+
+This effect shows that when education increase by one year, the wage is likely to increase by 60 usd. This effect is statistically significant becasue of a p-value less than 0.05 and a CI not including 0.
+
+However, this might not be able to account for all causal effect since there are omit variable bias that the naive regression cannot explain the effect of other covariates and confounders. For example, social connection might impact wage as well. Also, one's IQ might influence both year of education and wage, which is a confounder. However, naive regression failed to account for it.
+
+5.B
+```{r}
+relevance <- lm(educ ~ feduc, data = wage)
+summary(relevance)
+```
+```{r}
+non_direct <- lm(IQ ~ feduc, data = wage)
+summary(non_direct)
+wage$predicted_IQ <- predict(non_direct, wage)
+second_stage <- lm(wage ~ predicted_IQ, data = wage)
+summary(second_stage)
+```
+
+Relevance: We can see that father's education has a strong influence in children's education. When father's year of education increase by one year, the children's education increase by 0.3 years. This effect is statiscally significant due to a p-value less than 0.05.
+Exclusion: if for this question, other variables in the dataset like IQ are not our interest, and we only focus on feduc, meduc, educ, and wage, then exclusion holds, since feduc will not impact other independent variable and there will not be any additional paths to dependent variable. feduc->edu->wage is the only path. However, if we take IQ into account, feduc has a positive statistically significant effect on IQ, and IQ has a significant effect on wage, exclusion not hold in this case.
+Exogeneity: parental education is determined before children birth, thus will not impact other unobserved variables like children's personal motivation, being exogenous to child's decisions and all other factors.
+
+
+5C
+```{r}
+wage$predicted_educ <- predict(relevance, wage)
+second_stage <- lm(wage ~ predicted_educ, data = wage)
+summary(second_stage)
+```
+As education increase by one unit, the wage will increase by 100.70. This effect is statistically significant because of the small p-value.
+5D
+```{r}
+model_5D <- iv_robust(wage ~ educ | feduc, data = wage)
+summary(model_5D)
+```
+We see that the point estimates for both methods are the same. However, there are slight difference in standard errors. In iv_robust, the standard errors of intercept and educ coefficient are both higher than the lm std. The iv_robust one is more plausible because it adjusts to heteroskedasticity. Thus in the case where variance of errors are different within different units, vanilla lm might be overconfident with the estimate, ie smaller std and thus narrower CI.
+
+
+
+
